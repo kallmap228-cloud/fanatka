@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import random
-import string
+import os
 import aiohttp
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -48,19 +49,12 @@ def generate_readable_username(length: int) -> str:
     return "".join(res)
 
 async def check_username_status(username: str, session: aiohttp.ClientSession):
-    """
-    Проверка юзернейма. Возвращает:
-    True  — если юзернейм свободен
-    False — если занят
-    None  — если IP заблокирован Telegram/Fragment (Rate Limit)
-    """
     try:
         async with session.get(f"https://t.me/{username}", headers=HEADERS, timeout=3) as resp:
-            if resp.status == 429 or resp.status == 403:
-                return None  # IP в бане
+            if resp.status in (429, 403):
+                return None
             if resp.status != 200:
                 return False
-            
             html = await resp.text()
             if any(marker in html for marker in ["tgme_page_photo", "tgme_page_extra", "tgme_page_description", "suspended"]):
                 return False
@@ -121,16 +115,14 @@ async def search_random_loop(msg: types.Message, length: int):
     try:
         attempts = 0
         async with aiohttp.ClientSession() as session:
-            while attempts < 15:  # До 15 итераций, чтобы не виснуть навечно
+            while attempts < 15:
                 attempts += 1
                 candidates = [generate_readable_username(length) for _ in range(6)]
-                
                 tasks = [check_username_status(cand, session) for cand in candidates]
                 results = await asyncio.gather(*tasks)
                 
-                # Проверка на то, забанен ли IP
                 if all(r is None for r in results):
-                    await msg.edit_text("⚠️ Telegram временно ограничил частые запросы с вашего IP. Подождите 2-3 минуты и нажмите снова.")
+                    await msg.edit_text("⚠️ Telegram ограничил запросы. Подождите 2 минуты.")
                     return
 
                 for cand, status in zip(candidates, results):
@@ -142,10 +134,9 @@ async def search_random_loop(msg: types.Message, length: int):
                             disable_web_page_preview=True
                         )
                         return
-                
                 await asyncio.sleep(0.3)
                 
-            await msg.edit_text("❌ В этой попытке свободный юзернейм не попался. Нажмите кнопку еще раз!")
+            await msg.edit_text("❌ В этой попытке ничего не нашлось. Нажмите кнопку еще раз!")
     except asyncio.CancelledError:
         pass
 
@@ -189,7 +180,6 @@ async def search_word_loop(msg: types.Message, word: str):
                         found.append(f"@{cand}")
                         if len(found) >= 2:
                             break
-                
                 if len(found) >= 2:
                     break
                 await asyncio.sleep(0.3)
@@ -202,7 +192,21 @@ async def search_word_loop(msg: types.Message, word: str):
     except asyncio.CancelledError:
         pass
 
+# --- ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER ---
+async def handle_health(request):
+    return web.Response(text="Bot is running!")
+
 async def main():
+    # Запускаем виртуальный веб-сервер, чтобы Render не просил денег
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    # Запуск самого бота
     while True:
         try:
             await dp.start_polling(bot)
@@ -211,3 +215,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+                         
