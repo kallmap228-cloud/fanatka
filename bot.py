@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 import os
-import aiohttp
+from contextlib import suppress
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
@@ -11,7 +11,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramNetworkError
 
 # ==================== НАСТРОЙКИ ВЛАДЕЛЬЦА ====================
 BOT_TOKEN = "8984242690:AAH0YZPbOLLXWe7Zu2OZlFOmKDDe9flNN8g"
@@ -31,14 +31,11 @@ CONSONANTS = "bcdfghklmnpqrstvwxz"
 PREFIXES = ["get", "my", "the", "iam", "hey", "go", "pro", "real", "app", "open", "just", "one", "try", "use", "top", "fast", "pure", "easy", "meta", "cyber"]
 SUFFIXES = ["lab", "hub", "pro", "box", "net", "app", "top", "vip", "one", "dev", "zone", "spot", "space", "base", "site", "io", "co", "me", "hq", "inc"]
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
-}
-
 class Form(StatesGroup):
     waiting_for_word = State()
 
 def generate_readable_username(length: int) -> str:
+    """ Генерация читаемых юзернеймов (чередование согласных и гласных) """
     res = []
     start_with_consonant = random.choice([True, False])
     for i in range(length):
@@ -48,30 +45,22 @@ def generate_readable_username(length: int) -> str:
             res.append(random.choice(VOWELS))
     return "".join(res)
 
-async def check_username_status(username: str, session: aiohttp.ClientSession):
+async def is_username_free(username: str) -> bool:
+    """ Нативная проверка через официальный Bot API Telegram """
     try:
-        async with session.get(f"https://t.me/{username}", headers=HEADERS, timeout=3) as resp:
-            if resp.status in (429, 403):
-                return None
-            if resp.status != 200:
-                return False
-            html = await resp.text()
-            if any(marker in html for marker in ["tgme_page_photo", "tgme_page_extra", "tgme_page_description", "suspended"]):
-                return False
+        await bot.get_chat(f"@{username}")
+        return False  # Если чат найден — юзернейм занят
+    except TelegramBadRequest as e:
+        # Ошибка "chat not found" означает, что юзернейм полностью свободен!
+        if "chat not found" in e.message.lower():
+            return True
+        return False
+    except TelegramRetryAfter as e:
+        # Если Telegram просит снизить скорость
+        await asyncio.sleep(e.retry_after)
+        return await is_username_free(username)
     except Exception:
-        return None
-
-    try:
-        async with session.get(f"https://fragment.com/username/{username}", headers=HEADERS, timeout=3) as resp:
-            if resp.status == 200:
-                f_html = await resp.text()
-                blocked_terms = ["Auction", "Sold", "On sale", "Minimum Bid", "Place bid", "Taken", "Unavailable"]
-                if any(term in f_html for term in blocked_terms):
-                    return False
-    except Exception:
-        pass
-
-    return True
+        return False
 
 def stop_previous_task(user_id: int):
     if user_id in user_tasks and not user_tasks[user_id].done():
@@ -91,14 +80,14 @@ async def start_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     stop_previous_task(message.from_user.id)
-    await message.answer("👋 Бот готов к работе! Выберите действие ниже:", reply_markup=main_kb())
+    await message.answer("👋 Бот обновлен и переведен на прямой API Telegram! Выберите действие:", reply_markup=main_kb())
 
 @dp.message(F.text == "🎲 Найти 5-буквенные")
 async def find_5_letters(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     stop_previous_task(message.from_user.id)
-    msg = await message.answer("🔎 Ищу подходящий юзернейм...")
+    msg = await message.answer("🔎 Запускаю прямой поиск 5-буквенных юзернеймов...")
     task = asyncio.create_task(search_random_loop(msg, length=5))
     user_tasks[message.from_user.id] = task
 
@@ -107,36 +96,34 @@ async def find_6_letters(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     stop_previous_task(message.from_user.id)
-    msg = await message.answer("🔎 Ищу подходящий юзернейм...")
+    msg = await message.answer("🔎 Запускаю прямой поиск 6-буквенных юзернеймов...")
     task = asyncio.create_task(search_random_loop(msg, length=6))
     user_tasks[message.from_user.id] = task
 
 async def search_random_loop(msg: types.Message, length: int):
     try:
-        attempts = 0
-        async with aiohttp.ClientSession() as session:
-            while attempts < 15:
-                attempts += 1
-                candidates = [generate_readable_username(length) for _ in range(6)]
-                tasks = [check_username_status(cand, session) for cand in candidates]
-                results = await asyncio.gather(*tasks)
-                
-                if all(r is None for r in results):
-                    await msg.edit_text("⚠️ Telegram ограничил запросы. Подождите 2 минуты.")
-                    return
+        count = 0
+        while True:
+            count += 1
+            cand = generate_readable_username(length)
+            
+            # Показываем живой прогресс каждые 15 проверок
+            if count % 15 == 0:
+                with suppress(Exception):
+                    await msg.edit_text(f"🔎 Проверено вариантов: {count}... Ищу свободный {length}-буквенный...")
 
-                for cand, status in zip(candidates, results):
-                    if status is True:
-                        await msg.edit_text(
-                            f"✅ Юзернейм найден {length} букв: @{cand}\n\n"
-                            f"🔗 https://t.me/{cand}\n"
-                            f"🔗 https://fragment.com/username/{cand}",
-                            disable_web_page_preview=True
-                        )
-                        return
-                await asyncio.sleep(0.3)
-                
-            await msg.edit_text("❌ В этой попытке ничего не нашлось. Нажмите кнопку еще раз!")
+            if await is_username_free(cand):
+                await msg.edit_text(
+                    f"✅ **Найден свободный юзернейм ({length} букв):**\n\n"
+                    f"👉 `@{cand}`\n\n"
+                    f"🔗 https://t.me/{cand}\n"
+                    f"🔗 https://fragment.com/username/{cand}",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+                return
+            
+            await asyncio.sleep(0.08)  # Безопасный интервал для Telegram API
     except asyncio.CancelledError:
         pass
 
@@ -158,7 +145,7 @@ async def process_word(message: types.Message, state: FSMContext):
         return
 
     stop_previous_task(message.from_user.id)
-    msg = await message.answer("🔎 Ищу подходящие юзернеймы...")
+    msg = await message.answer(f"🔎 Ищу свободные комбинации для «{word}»...")
     task = asyncio.create_task(search_word_loop(msg, word))
     user_tasks[message.from_user.id] = task
 
@@ -168,36 +155,26 @@ async def search_word_loop(msg: types.Message, word: str):
         random.shuffle(candidates)
         found = []
         
-        async with aiohttp.ClientSession() as session:
-            batch_size = 6
-            for i in range(0, len(candidates), batch_size):
-                batch = candidates[i:i + batch_size]
-                tasks = [check_username_status(cand, session) for cand in batch]
-                results = await asyncio.gather(*tasks)
-                
-                for cand, status in zip(batch, results):
-                    if status is True:
-                        found.append(f"@{cand}")
-                        if len(found) >= 2:
-                            break
+        for cand in candidates:
+            if await is_username_free(cand):
+                found.append(f"@{cand}")
                 if len(found) >= 2:
                     break
-                await asyncio.sleep(0.3)
+            await asyncio.sleep(0.08)
 
         if found:
             res = "\n".join(found)
-            await msg.edit_text(f"✅ Юзернеймы найдены для «{word}»:\n\n{res}", disable_web_page_preview=True)
+            await msg.edit_text(f"✅ Найдены свободные варианты для «{word}»:\n\n{res}", disable_web_page_preview=True)
         else:
-            await msg.edit_text(f"❌ Не удалось найти свободные варианты для «{word}».")
+            await msg.edit_text(f"❌ Все стандартные комбинации для «{word}» оказались заняты.")
     except asyncio.CancelledError:
         pass
 
-# --- ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER ---
+# --- ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER ---
 async def handle_health(request):
     return web.Response(text="Bot is running!")
 
 async def main():
-    # Запускаем виртуальный веб-сервер, чтобы Render не просил денег
     app = web.Application()
     app.router.add_get("/", handle_health)
     runner = web.AppRunner(app)
@@ -206,13 +183,11 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # Запуск самого бота
     while True:
         try:
             await dp.start_polling(bot)
-        except (TelegramNetworkError, aiohttp.ClientError):
+        except (TelegramNetworkError, Exception):
             await asyncio.sleep(3)
 
 if __name__ == "__main__":
     asyncio.run(main())
-                         
