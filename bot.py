@@ -23,13 +23,34 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-user_tasks = {}
+# Хранилище активных задач и сообщений: {user_id: {"task": Task, "msg": Message}}
+user_searches = {}
 
 VOWELS = "aeiou"
 CONSONANTS = "bcdfghklmnpqrstvwxz"
 
 PREFIXES = ["get", "my", "the", "iam", "hey", "go", "pro", "real", "app", "open", "just", "one", "try", "use", "top", "fast", "pure", "easy", "meta", "cyber"]
 SUFFIXES = ["lab", "hub", "pro", "box", "net", "app", "top", "vip", "one", "dev", "zone", "spot", "space", "base", "site", "io", "co", "me", "hq", "inc"]
+
+# ⛔ БАЗА ЗАВЕДОМО ЗАНЯТЫХ ЮЗЕРНЕЙМОВ (Локальный фильтр без запросов в сеть)
+KNOWN_TAKEN = {
+    # Популярные слова и роли
+    "admin", "owner", "group", "channel", "music", "photo", "video", "media", "world",
+    "super", "cyber", "smart", "store", "cloud", "happy", "black", "white", "gamer",
+    "agent", "apple", "money", "space", "poker", "coins", "trade", "trend", "flash",
+    "magic", "house", "hotel", "beach", "party", "dance", "night", "light", "dream",
+    "smile", "heart", "angel", "devil", "ghost", "witch", "ninja", "pirate", "robot",
+    "alien", "tiger", "lion", "bear", "wolf", "eagle", "shark", "whale", "snake",
+    "paper", "stone", "water", "earth", "fire", "storm", "solar", "lunar", "star",
+    "planet", "galaxy", "astro", "cosmo", "delta", "alpha", "omega", "sigma", "ultra",
+    # Крипта, финансы и бренды
+    "crypto", "bitcoin", "coin", "token", "chain", "block", "wallet", "market",
+    "stock", "share", "forex", "gold", "silver", "bronze", "metal", "iron", "steel",
+    "power", "force", "speed", "turbo", "boost", "hyper", "mega", "giga", "prime",
+    "first", "final", "total", "grand", "royal", "crown", "queen", "king", "prince",
+    "lord", "boss", "chief", "master", "hero", "legend", "vamp", "zomb", "nexus",
+    "pixel", "anime", "manga", "logic", "focus", "sharp", "fresh", "clean", "sweet"
+}
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
@@ -48,46 +69,53 @@ def generate_readable_username(length: int) -> str:
             res.append(random.choice(VOWELS))
     return "".join(res)
 
+async def cancel_and_clean_previous(user_id: int):
+    """ Отменяет прошлую задачу И УДАЛЯЕТ старое сообщение с поиском """
+    if user_id in user_searches:
+        data = user_searches.pop(user_id)
+        task = data.get("task")
+        msg = data.get("msg")
+        
+        if task and not task.done():
+            task.cancel()
+        if msg:
+            with suppress(Exception):
+                await msg.delete()
+
 async def is_username_free(username: str, session: ClientSession) -> bool:
-    """
-    Тройная проверка доступности:
-    1. Telegram Bot API (проверка активных аккаунтов/каналов)
-    2. Fragment.com (проверка аукционов, NFT и продаваемых юзернеймов)
-    3. t.me (проверка системных блокировок)
-    """
-    # 1. Проверка через Telegram Bot API
+    # 1. Быстрый локальный фильтр (проверка по черному списку)
+    if username in KNOWN_TAKEN:
+        return False
+
+    # 2. Проверка через Telegram Bot API
     try:
         await bot.get_chat(f"@{username}")
-        return False  # Аккаунт/канал существует -> Занят
+        return False  # Аккаунт существует -> Занят
     except TelegramBadRequest as e:
         if "chat not found" not in e.message.lower():
-            return False  # Забанен или недействителен
+            return False  # Забанен или недоступен
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         return await is_username_free(username, session)
     except Exception:
         return False
 
-    # 2. Проверка через Fragment.com (Отсеивает ekafu и подобные NFT)
+    # 3. Проверка через Fragment.com (Отсеивает NFT и продаваемые варианты)
     try:
         url = f"https://fragment.com/username/{username}"
-        async with session.get(url, headers=HEADERS, timeout=ClientTimeout(total=3)) as resp:
+        async with session.get(url, headers=HEADERS, timeout=ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 html = await resp.text()
-                # Маркеры того, что юзернейм на Fragment (продан, на аукционе, занят)
-                invalid_markers = [
-                    "Auction", "Sold", "On sale", "Minimum Bid", 
-                    "Place bid", "Buy for", "Taken", "Owner"
-                ]
+                invalid_markers = ["Auction", "Sold", "On sale", "Minimum Bid", "Place bid", "Buy for", "Taken", "Owner"]
                 if any(marker in html for marker in invalid_markers):
                     return False
     except Exception:
         pass
 
-    # 3. Дополнительная веб-проверка t.me
+    # 4. Проверка через t.me
     try:
         url = f"https://t.me/{username}"
-        async with session.get(url, headers=HEADERS, timeout=ClientTimeout(total=3)) as resp:
+        async with session.get(url, headers=HEADERS, timeout=ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 html = await resp.text()
                 if any(m in html for m in ["tgme_page_photo", "tgme_page_extra", "tgme_page_description", "suspended"]):
@@ -96,10 +124,6 @@ async def is_username_free(username: str, session: ClientSession) -> bool:
         pass
 
     return True
-
-def stop_previous_task(user_id: int):
-    if user_id in user_tasks and not user_tasks[user_id].done():
-        user_tasks[user_id].cancel()
 
 def main_kb():
     return ReplyKeyboardMarkup(
@@ -114,28 +138,30 @@ def main_kb():
 async def start_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    stop_previous_task(message.from_user.id)
-    await message.answer("👋 Бот обновлен! Добавлена глубокая проверка Fragment и фильтрация NFT.", reply_markup=main_kb())
+    await cancel_and_clean_previous(message.from_user.id)
+    await message.answer("👋 Бот обновлен! Добавлено удаление старых сообщений и быстрый фильтр занятых слов.", reply_markup=main_kb())
 
 @dp.message(F.text == "🎲 Найти 5-буквенные")
 async def find_5_letters(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    stop_previous_task(message.from_user.id)
-    msg = await message.answer("🔎 Ищу свободный 5-буквенный юзернейм (с фильтром Fragment)...")
-    task = asyncio.create_task(search_random_loop(msg, length=5))
-    user_tasks[message.from_user.id] = task
+    await cancel_and_clean_previous(message.from_user.id)
+    msg = await message.answer("🔎 Ищу свободный 5-буквенный юзернейм...")
+    
+    task = asyncio.create_task(search_random_loop(msg, length=5, user_id=message.from_user.id))
+    user_searches[message.from_user.id] = {"task": task, "msg": msg}
 
 @dp.message(F.text == "🎲 Найти 6-буквенные")
 async def find_6_letters(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    stop_previous_task(message.from_user.id)
-    msg = await message.answer("🔎 Ищу свободный 6-буквенный юзернейм (с фильтром Fragment)...")
-    task = asyncio.create_task(search_random_loop(msg, length=6))
-    user_tasks[message.from_user.id] = task
+    await cancel_and_clean_previous(message.from_user.id)
+    msg = await message.answer("🔎 Ищу свободный 6-буквенный юзернейм...")
+    
+    task = asyncio.create_task(search_random_loop(msg, length=6, user_id=message.from_user.id))
+    user_searches[message.from_user.id] = {"task": task, "msg": msg}
 
-async def search_random_loop(msg: types.Message, length: int):
+async def search_random_loop(msg: types.Message, length: int, user_id: int):
     try:
         count = 0
         async with ClientSession() as session:
@@ -143,12 +169,12 @@ async def search_random_loop(msg: types.Message, length: int):
                 count += 1
                 cand = generate_readable_username(length)
                 
-                if count % 15 == 0:
+                # Обновляем текст каждые 20 проверок
+                if count % 20 == 0:
                     with suppress(Exception):
                         await msg.edit_text(f"🔎 Проверено вариантов: {count}... Ищу свободный {length}-буквенный...")
 
                 if await is_username_free(cand, session):
-                    # Форматирование HTML для копирования в один клик через <code>
                     text = (
                         f"<b>✅ Найден 100% свободный юзернейм!</b>\n\n"
                         f"Нажмите для копирования:\n"
@@ -158,9 +184,10 @@ async def search_random_loop(msg: types.Message, length: int):
                         f"🔗 <a href='https://fragment.com/username/{cand}'>Проверить на Fragment</a>"
                     )
                     await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+                    user_searches.pop(user_id, None)
                     return
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.08)
     except asyncio.CancelledError:
         pass
 
@@ -168,7 +195,7 @@ async def search_random_loop(msg: types.Message, length: int):
 async def ask_word(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    stop_previous_task(message.from_user.id)
+    await cancel_and_clean_previous(message.from_user.id)
     await state.set_state(Form.waiting_for_word)
     await message.answer("Введите базовое слово (например: `apple` или `tiger`):")
 
@@ -181,12 +208,13 @@ async def process_word(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Вводите только буквы латинского алфавита.")
         return
 
-    stop_previous_task(message.from_user.id)
+    await cancel_and_clean_previous(message.from_user.id)
     msg = await message.answer(f"🔎 Ищу свободные варианты для «{word}»...")
-    task = asyncio.create_task(search_word_loop(msg, word))
-    user_tasks[message.from_user.id] = task
+    
+    task = asyncio.create_task(search_word_loop(msg, word, user_id=message.from_user.id))
+    user_searches[message.from_user.id] = {"task": task, "msg": msg}
 
-async def search_word_loop(msg: types.Message, word: str):
+async def search_word_loop(msg: types.Message, word: str, user_id: int):
     try:
         candidates = [f"{p}{word}" for p in PREFIXES] + [f"{word}{s}" for s in SUFFIXES]
         random.shuffle(candidates)
@@ -198,7 +226,7 @@ async def search_word_loop(msg: types.Message, word: str):
                     found.append(f"<code>@{cand}</code>")
                     if len(found) >= 2:
                         break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.08)
 
         if found:
             res = "\n".join(found)
@@ -209,6 +237,8 @@ async def search_word_loop(msg: types.Message, word: str):
             )
         else:
             await msg.edit_text(f"❌ Все комбинации для «{word}» оказались заняты.")
+        
+        user_searches.pop(user_id, None)
     except asyncio.CancelledError:
         pass
 
